@@ -1,39 +1,96 @@
 ﻿import { NextResponse } from 'next/server';
 import * as cheerio from 'cheerio';
 
-async function fetchText(url: string, extraHeaders: Record<string, string> = {}) {
+// Phrases that indicate a paywall / blocker page
+const BLOCK_PATTERNS = [
+  /view original article/i,
+  /subscribe to continue/i,
+  /this content is for subscribers/i,
+  /already a subscriber/i,
+  /create a free account to continue/i,
+  /subscribe now/i,
+];
+
+// Truncation markers used by some sites — "loading" placeholders
+const TRUNCATION_MARKERS = [
+  /טוען\.{2,}/,      // Hebrew: "Loading..."
+  /loading\.{2,}/i,  // English: "Loading..."
+  /continue reading/i,
+  /read more/i,
+];
+
+function looksLikeBlocker(text: string): boolean {
+  for (const p of BLOCK_PATTERNS) if (p.test(text)) return true;
+  return false;
+}
+
+function looksTruncated(text: string): boolean {
+  for (const p of TRUNCATION_MARKERS) if (p.test(text)) return true;
+  return false;
+}
+
+function extractArticle(html: string): { title: string; content: string } {
+  const $ = cheerio.load(html);
+  $(
+    'script, style, nav, header, footer, aside, form, iframe, noscript, ' +
+      '.ad, .ads, [class*="cookie"], [class*="banner"], [class*="promo"], ' +
+      '[class*="subscribe"], [class*="paywall"], [class*="premium"], ' +
+      '[class*="comment"], [class*="related"], [class*="recommend"]'
+  ).remove();
+
+  const title =
+    $('h1').first().text().trim() || $('title').text().trim() || 'Article';
+
+  // Grab the longest run of <p> tags inside a plausible article container
+  let bestText = '';
+  $(
+    'article, main, [role="main"], .article-body, .article__body, ' +
+      '.article-content, .post-content, .entry-content, #content, body'
+  ).each((_, el) => {
+    const txt = $(el)
+      .find('p')
+      .map((_, p) => $(p).text().trim())
+      .get()
+      .filter((t) => t.length > 20)
+      .join('\n\n');
+    if (txt.length > bestText.length) bestText = txt;
+  });
+
+  if (bestText.length < 400) {
+    bestText = $('p')
+      .map((_, p) => $(p).text().trim())
+      .get()
+      .filter((t) => t.length > 40)
+      .join('\n\n');
+  }
+
+  if (bestText.length < 200) {
+    bestText = $('body').text().replace(/\s+/g, ' ').trim();
+  }
+
+  return { title, content: bestText };
+}
+
+async function fetchText(url: string) {
   const res = await fetch(url, {
     headers: {
       'User-Agent':
-        'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'he-IL,he;q=0.9,en;q=0.8',
-      ...extraHeaders,
     },
     redirect: 'follow',
   });
   return await res.text();
 }
 
-function extractArticle(html: string): string {
-  const $ = cheerio.load(html);
-  $('script, style, nav, header, footer, aside, form, iframe, noscript').remove();
-  // Prefer common article containers, fall back to body
-  const candidates = [
-    'article',
-    'main',
-    '[role="main"]',
-    '.article-body',
-    '.article__body',
-    '.post-content',
-    '.entry-content',
-    '#content',
-    'body',
-  ];
-  for (const sel of candidates) {
-    const txt = $(sel).text().replace(/\s+/g, ' ').trim();
-    if (txt.length > 400) return txt;
-  }
-  return '';
+function isGoodArticle(text: string): boolean {
+  if (text.length < 400) return false;
+  if (looksLikeBlocker(text)) return false;
+  if (looksTruncated(text) && text.length < 1500) return false;
+  return true;
 }
 
 export async function POST(request: Request) {
@@ -42,58 +99,68 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'URL is required' }, { status: 400 });
   }
 
-  // 1) Try the original page
+  // 1) Direct
   try {
     const html = await fetchText(url);
-    const text = extractArticle(html);
-    if (text.length >= 400) {
-      return NextResponse.json({ content: text, source: url, via: 'direct' });
+    const { title, content } = extractArticle(html);
+    if (isGoodArticle(content)) {
+      return NextResponse.json({
+        title,
+        content,
+        via: 'direct',
+        source: url,
+        archiveUrl: `https://archive.ph/newest/${url}`,
+      });
     }
-  } catch {
-    // fall through to archives
-  }
+  } catch {}
 
-  // 2) Try archive.today (multiple mirrors + newest-snapshot endpoint)
-  const archiveUrls = [
+  // 2) Archives
+  for (const a of [
     `https://archive.ph/newest/${url}`,
-    `https://archive.today/newest/${url}`,
     `https://archive.is/newest/${url}`,
-  ];
-  for (const a of archiveUrls) {
+    `https://archive.today/newest/${url}`,
+  ]) {
     try {
       const html = await fetchText(a);
-      // If archive.today has no snapshot, it shows a form/search page
-      if (/No results|not archived|not been archived/i.test(html)) continue;
-      // archive.ph may redirect to the snapshot URL; extract text
-      const text = extractArticle(html);
-      if (text.length >= 400) {
-        return NextResponse.json({ content: text, source: url, via: 'archive.today' });
+      const { title, content } = extractArticle(html);
+      if (isGoodArticle(content)) {
+        return NextResponse.json({
+          title,
+          content,
+          via: 'archive.today',
+          source: url,
+          archiveUrl: a,
+        });
       }
-    } catch {
-      // try next mirror
-    }
+    } catch {}
   }
 
-  // 3) Try the Wayback Machine
+  // 3) Wayback
   try {
-    const waybackApi = `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`;
-    const meta = await fetch(waybackApi).then((r) => r.json());
+    const meta = await fetch(
+      `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`
+    ).then((r) => r.json());
     const snap = meta?.archived_snapshots?.closest?.url;
     if (snap) {
       const html = await fetchText(snap);
-      const text = extractArticle(html);
-      if (text.length >= 400) {
-        return NextResponse.json({ content: text, source: url, via: 'wayback' });
+      const { title, content } = extractArticle(html);
+      if (isGoodArticle(content)) {
+        return NextResponse.json({
+          title,
+          content,
+          via: 'wayback',
+          source: url,
+          archiveUrl: `https://archive.ph/newest/${url}`,
+        });
       }
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
 
-  // 4) Nothing worked
   return NextResponse.json(
     {
-      error: 'Could not find the article in any archive. Try opening it manually.',
+      error:
+        'This site is a hard paywall and no full archive snapshot was found. ' +
+        'Tap the button to check archive.today manually.',
       archiveUrl: `https://archive.ph/newest/${url}`,
     },
     { status: 400 }
